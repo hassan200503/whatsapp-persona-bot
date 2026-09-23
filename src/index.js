@@ -56,7 +56,7 @@ async function start() {
   const sock = makeWASocket({
     version,
     auth: state,
-    logger: logger.child({ module: "baileys" }),
+    logger: logger.child({ module: "baileys" }, { level: "warn" }),
     printQRInTerminal: false, // we handle QR ourselves below (terminal + image file)
     browser: ["Persona Bot", "Chrome", "1.0.0"],
   });
@@ -143,8 +143,17 @@ async function handleMessage(sock, msg) {
   if (isGroup && !REPLY_IN_GROUPS) return;
   if (!AWAY_MODE) return; // you're online — stay silent, let the person reply themselves
 
-  const senderNumber = (msg.key.participant || chatId).split("@")[0];
-  if (IGNORE_NUMBERS.has(senderNumber)) return;
+  logger.info({ chatId, isGroup }, "Incoming message");
+
+  // WhatsApp now addresses many chats by an opaque "@lid" id instead of the phone
+  // number, so check every identifier the message carries against the ignore list.
+  const identifiers = [msg.key.senderPn, msg.key.participantPn, msg.key.participant, chatId]
+    .filter(Boolean)
+    .map((jid) => jid.split("@")[0].split(":")[0]);
+  if (identifiers.some((n) => IGNORE_NUMBERS.has(n))) {
+    logger.info({ chatId }, "Sender is on IGNORE_NUMBERS, staying silent");
+    return;
+  }
 
   if (!canReply(chatId, MAX_PER_HOUR)) {
     logger.warn({ chatId }, "Hit per-chat hourly reply cap, staying silent");
