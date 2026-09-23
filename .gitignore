@@ -1,0 +1,6 @@
+node_modules/
+.env
+auth/
+logs/
+data/style-log.jsonl
+latest-qr.png
