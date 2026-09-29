@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/index.js",
     "reset-session": "node scripts/reset-session.js",
-    "test-companion": "node scripts/test-companion.js"
+    "test-companion": "node scripts/test-companion.js",
+    "reflect-now": "node scripts/reflect-now.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",

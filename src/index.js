@@ -16,6 +16,7 @@ import { generateReply, clearHistory } from "./replyEngine.js";
 import { recordOwnMessage, styleLogSize } from "./styleLearner.js";
 import { canReply, recordReply, randomDelayMs } from "./rateLimiter.js";
 import { handleCompanionMessage } from "./companion/companion.js";
+import { initScheduler } from "./companion/scheduler.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, "..", "auth");
@@ -109,6 +110,11 @@ async function start() {
         `Away mode is currently: ${AWAY_MODE ? "ON (auto-replying)" : "OFF (silent, learning only)"}`
       );
       logger.info(`Learned ${styleLogSize()} of your real messages so far.`);
+
+      const selfChatId = bareJid(sock.user?.id);
+      if (ENABLE_COMPANION && selfChatId) {
+        initScheduler((text) => sock.sendMessage(selfChatId, { text }));
+      }
     }
   });
 

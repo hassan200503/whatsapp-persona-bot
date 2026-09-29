@@ -38,10 +38,12 @@ function formatJournal() {
 export function buildCompanionSystemPrompt({ toolsEnabled = false } = {}) {
   const persona = loadPersonaFile();
   const toolsRule = toolsEnabled
-    ? "- When the owner shares something worth remembering long-term (a goal, an interest, a fact about their life, something they want you to remind them of), you may call the appropriate tool to save it. Don't narrate that you're saving it unless it's natural to mention."
-    : "- You don't have any tools yet — you can't actually save reminders or facts on your own right now, so don't claim to.";
+    ? "- You have one tool: set_reminder, for anything the owner wants you to remind them about later. Call it whenever that's clearly what they mean, using the current date/time above to resolve relative times. You do NOT have a way to save general facts about them yet — you only remember what naturally stays in your recent conversation and nightly reflections, so don't claim to be saving something unless it's a reminder."
+    : "- You don't have any tools yet — you can't actually save reminders on your own right now, so don't claim to.";
 
   return `You are a personal AI companion the owner talks to directly in their own WhatsApp "Message Yourself" chat. You are NOT ghostwriting as them — you are your own character, replying in the first person as yourself.
+
+The current date/time is ${new Date().toString()}. Use this to resolve any relative time the owner mentions (e.g. "in 2 hours", "tomorrow morning") into an exact time.
 
 Who you are (owner-defined):
 ${persona}

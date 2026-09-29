@@ -7,7 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 import Groq from "groq-sdk";
 import { logger } from "../logger.js";
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-lite-latest";
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 
 let genAI = null;
@@ -29,12 +29,13 @@ function getGroq() {
 }
 
 // history: [{ role: "user"|"companion", content: string }]
-// Returns { text, functionCalls } (functionCalls is undefined until tools are wired in).
-export async function generateCompanionReply({ systemPrompt, history, tools = [] }) {
+// toolExecutor(name, args) => result object; only used when tools is non-empty.
+// Tool calling only runs through Gemini — Groq is a plain-text fallback.
+export async function generateCompanionReply({ systemPrompt, history, tools = [], toolExecutor }) {
   const gemini = getGenAI();
   if (gemini) {
     try {
-      return await callGemini(gemini, systemPrompt, history, tools);
+      return await callGemini(gemini, systemPrompt, history, tools, toolExecutor);
     } catch (err) {
       logger.warn({ err: err?.message }, "Gemini call failed, trying Groq fallback");
     }
@@ -43,7 +44,7 @@ export async function generateCompanionReply({ systemPrompt, history, tools = []
   const groqClient = getGroq();
   if (groqClient) {
     try {
-      return await callGroq(groqClient, systemPrompt, history);
+      return await callGroq(groqClient, systemPrompt, history, tools, toolExecutor);
     } catch (err) {
       logger.error({ err: err?.message }, "Groq fallback also failed");
     }
@@ -57,7 +58,31 @@ export async function generateCompanionReply({ systemPrompt, history, tools = []
   throw new Error("Both Gemini and Groq failed to generate a reply.");
 }
 
-async function callGemini(gemini, systemPrompt, history, tools) {
+const MAX_TOOL_ROUNDS = 5;
+
+// Our tool declarations are standard (lowercase-type) JSON Schema. Gemini's
+// function-calling wants the same shape but with UPPERCASE type names.
+function toGeminiSchema(node) {
+  if (!node || typeof node !== "object") return node;
+  const out = { ...node };
+  if (typeof out.type === "string") out.type = out.type.toUpperCase();
+  if (out.properties) {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties).map(([k, v]) => [k, toGeminiSchema(v)])
+    );
+  }
+  if (out.items) out.items = toGeminiSchema(out.items);
+  return out;
+}
+function toGeminiFunctionDeclarations(tools) {
+  return tools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    parameters: toGeminiSchema(t.parameters),
+  }));
+}
+
+async function callGemini(gemini, systemPrompt, history, tools, toolExecutor) {
   const contents = history.map((turn) => ({
     role: turn.role === "companion" ? "model" : "user",
     parts: [{ text: turn.content }],
@@ -65,19 +90,47 @@ async function callGemini(gemini, systemPrompt, history, tools) {
 
   const config = { systemInstruction: systemPrompt };
   if (tools.length > 0) {
-    config.tools = [{ functionDeclarations: tools }];
+    config.tools = [{ functionDeclarations: toGeminiFunctionDeclarations(tools) }];
   }
 
-  const response = await gemini.models.generateContent({
-    model: GEMINI_MODEL,
-    contents,
-    config,
-  });
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const response = await gemini.models.generateContent({
+      model: GEMINI_MODEL,
+      contents,
+      config,
+    });
 
-  return { text: response.text?.trim() || "", functionCalls: response.functionCalls };
+    const calls = response.functionCalls;
+    if (!calls || calls.length === 0) {
+      return { text: response.text?.trim() || "" };
+    }
+
+    contents.push({
+      role: "model",
+      parts: calls.map((c) => ({ functionCall: { name: c.name, args: c.args || {} } })),
+    });
+
+    const responseParts = [];
+    for (const call of calls) {
+      const result = toolExecutor
+        ? await toolExecutor(call.name, call.args || {})
+        : { error: "No tool executor configured" };
+      responseParts.push({ functionResponse: { name: call.name, response: result } });
+    }
+    contents.push({ role: "user", parts: responseParts });
+  }
+
+  return { text: "" };
 }
 
-async function callGroq(groqClient, systemPrompt, history) {
+function toGroqTools(tools) {
+  return tools.map((t) => ({
+    type: "function",
+    function: { name: t.name, description: t.description, parameters: t.parameters },
+  }));
+}
+
+async function callGroq(groqClient, systemPrompt, history, tools, toolExecutor) {
   const messages = [
     { role: "system", content: systemPrompt },
     ...history.map((turn) => ({
@@ -86,11 +139,33 @@ async function callGroq(groqClient, systemPrompt, history) {
     })),
   ];
 
-  const completion = await groqClient.chat.completions.create({
-    model: GROQ_MODEL,
-    messages,
-    max_tokens: 500,
-  });
+  const requestOpts = { model: GROQ_MODEL, messages, max_tokens: 500 };
+  if (tools.length > 0) requestOpts.tools = toGroqTools(tools);
 
-  return { text: completion.choices[0]?.message?.content?.trim() || "", functionCalls: undefined };
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const completion = await groqClient.chat.completions.create(requestOpts);
+    const message = completion.choices[0]?.message;
+    const toolCalls = message?.tool_calls;
+
+    if (!toolCalls || toolCalls.length === 0) {
+      return { text: message?.content?.trim() || "" };
+    }
+
+    messages.push({ role: "assistant", content: message.content || null, tool_calls: toolCalls });
+
+    for (const call of toolCalls) {
+      let args = {};
+      try {
+        args = JSON.parse(call.function.arguments || "{}");
+      } catch {
+        // leave args empty if the model sent malformed JSON
+      }
+      const result = toolExecutor
+        ? await toolExecutor(call.function.name, args)
+        : { error: "No tool executor configured" };
+      messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+    }
+  }
+
+  return { text: "" };
 }
