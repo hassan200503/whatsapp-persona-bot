@@ -8,6 +8,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 
@@ -17,6 +18,7 @@ import { recordOwnMessage, styleLogSize } from "./styleLearner.js";
 import { canReply, recordReply, randomDelayMs } from "./rateLimiter.js";
 import { handleCompanionMessage } from "./companion/companion.js";
 import { initScheduler } from "./companion/scheduler.js";
+import { transcribeAudio, synthesizeSpeech } from "./companion/voice.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, "..", "auth");
@@ -36,6 +38,7 @@ const MIN_DELAY = Number(process.env.MIN_REPLY_DELAY_SECONDS || 8);
 const MAX_DELAY = Number(process.env.MAX_REPLY_DELAY_SECONDS || 35);
 const MAX_PER_HOUR = Number(process.env.MAX_REPLIES_PER_CHAT_PER_HOUR || 6);
 const ENABLE_COMPANION = String(process.env.ENABLE_COMPANION ?? "true").toLowerCase() === "true";
+const ENABLE_VOICE_REPLIES = String(process.env.ENABLE_VOICE_REPLIES ?? "true").toLowerCase() === "true";
 
 let reconnectAttempts = 0;
 
@@ -138,13 +141,13 @@ async function handleMessage(sock, msg) {
   if (!chatId || chatId === "status@broadcast") return;
 
   const isGroup = chatId.endsWith("@g.us");
+  const audioMessage = msg.message?.audioMessage;
   const text = extractText(msg.message);
-  if (!text) return; // ignore media-only, reactions, etc. for now
 
   // ---- Messages YOU sent yourself (from your phone) ----
   if (msg.key.fromMe) {
     // Toggle command, sent to any chat, flips away mode for this run.
-    if (text.trim() === TOGGLE_KEYWORD) {
+    if (text && text.trim() === TOGGLE_KEYWORD) {
       AWAY_MODE = !AWAY_MODE;
       logger.info(`Away mode toggled -> ${AWAY_MODE ? "ON" : "OFF"}`);
       return;
@@ -155,17 +158,24 @@ async function handleMessage(sock, msg) {
     const isSelfChat =
       bareJid(chatId) === bareJid(sock.user?.id) || bareJid(chatId) === bareJid(sock.user?.lid);
     if (isSelfChat && ENABLE_COMPANION) {
-      await handleSelfChatMessage(sock, chatId, text);
+      if (audioMessage) {
+        await handleSelfChatVoiceMessage(sock, msg, chatId);
+      } else if (text) {
+        await handleSelfChatMessage(sock, chatId, text);
+      }
       return;
     }
 
     // Otherwise, this is a real message in your own voice to someone else —
     // learn from it, and treat it as "you handled this chat", so the
     // ghostwriter backs off.
+    if (!text) return; // media-only messages to someone else aren't learned from
     recordOwnMessage(text);
     clearHistory(chatId);
     return;
   }
+
+  if (!text) return; // the ghostwriter-to-others path doesn't handle media-only messages
 
   // ---- Incoming messages from other people ----
   if (isGroup && !REPLY_IN_GROUPS) return;
@@ -214,7 +224,7 @@ async function handleMessage(sock, msg) {
   logger.info({ chatId }, "Auto-reply sent");
 }
 
-async function handleSelfChatMessage(sock, chatId, text) {
+async function handleSelfChatMessage(sock, chatId, text, { voiceReply = false } = {}) {
   logger.info("Companion: message received in self-chat");
 
   let replyText;
@@ -229,8 +239,39 @@ async function handleSelfChatMessage(sock, chatId, text) {
   await sock.sendPresenceUpdate("composing", chatId).catch(() => {});
   await new Promise((r) => setTimeout(r, Math.min(2500, 500 + replyText.length * 15)));
 
+  if (voiceReply && ENABLE_VOICE_REPLIES) {
+    try {
+      const oggBuffer = await synthesizeSpeech(replyText);
+      await sock.sendMessage(chatId, { audio: oggBuffer, mimetype: "audio/ogg; codecs=opus", ptt: true });
+      logger.info("Companion: voice reply sent");
+      return;
+    } catch (err) {
+      logger.error({ err: err?.message }, "Voice synthesis failed, sending text instead");
+    }
+  }
+
   await sock.sendMessage(chatId, { text: replyText });
   logger.info("Companion: reply sent");
+}
+
+async function handleSelfChatVoiceMessage(sock, msg, chatId) {
+  logger.info("Companion: voice message received in self-chat");
+
+  let transcript;
+  try {
+    const buffer = await downloadMediaMessage(msg, "buffer", {}, {
+      logger,
+      reuploadRequest: sock.updateMediaMessage,
+    });
+    transcript = await transcribeAudio(buffer);
+  } catch (err) {
+    logger.error({ err: err?.message }, "Voice transcription failed");
+    return;
+  }
+  if (!transcript) return;
+
+  logger.info({ transcript }, "Companion: transcribed voice message");
+  await handleSelfChatMessage(sock, chatId, transcript, { voiceReply: true });
 }
 
 process.on("unhandledRejection", (err) => {
