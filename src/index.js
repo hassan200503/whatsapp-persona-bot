@@ -1,4 +1,4 @@
-import "dotenv/config";
+import "./env.js";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -15,6 +15,7 @@ import { logger, auditAutoReply } from "./logger.js";
 import { generateReply, clearHistory } from "./replyEngine.js";
 import { recordOwnMessage, styleLogSize } from "./styleLearner.js";
 import { canReply, recordReply, randomDelayMs } from "./rateLimiter.js";
+import { handleCompanionMessage } from "./companion/companion.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const AUTH_DIR = path.join(__dirname, "..", "auth");
@@ -33,6 +34,7 @@ const REPLY_IN_GROUPS = String(process.env.REPLY_IN_GROUPS || "false").toLowerCa
 const MIN_DELAY = Number(process.env.MIN_REPLY_DELAY_SECONDS || 8);
 const MAX_DELAY = Number(process.env.MAX_REPLY_DELAY_SECONDS || 35);
 const MAX_PER_HOUR = Number(process.env.MAX_REPLIES_PER_CHAT_PER_HOUR || 6);
+const ENABLE_COMPANION = String(process.env.ENABLE_COMPANION ?? "true").toLowerCase() === "true";
 
 let reconnectAttempts = 0;
 
@@ -45,6 +47,15 @@ function extractText(message) {
     message.videoMessage?.caption ||
     null
   );
+}
+
+// Strips the ":device" suffix WhatsApp JIDs carry (e.g. "123:45@s.whatsapp.net"),
+// so the owner's own id can be compared against a chat id reliably.
+function bareJid(jid) {
+  if (!jid) return null;
+  const [user, server] = jid.split("@");
+  if (!server) return null;
+  return `${user.split(":")[0]}@${server}`;
 }
 
 async function start() {
@@ -132,8 +143,19 @@ async function handleMessage(sock, msg) {
       logger.info(`Away mode toggled -> ${AWAY_MODE ? "ON" : "OFF"}`);
       return;
     }
-    // Otherwise, this is a real message in your own voice — learn from it,
-    // and treat it as "you handled this chat", so the bot backs off.
+
+    // Your own "Message Yourself" chat is the companion's interface — you're
+    // talking TO it, not ghostwriting AS yourself to someone else.
+    const isSelfChat =
+      bareJid(chatId) === bareJid(sock.user?.id) || bareJid(chatId) === bareJid(sock.user?.lid);
+    if (isSelfChat && ENABLE_COMPANION) {
+      await handleSelfChatMessage(sock, chatId, text);
+      return;
+    }
+
+    // Otherwise, this is a real message in your own voice to someone else —
+    // learn from it, and treat it as "you handled this chat", so the
+    // ghostwriter backs off.
     recordOwnMessage(text);
     clearHistory(chatId);
     return;
@@ -184,6 +206,25 @@ async function handleMessage(sock, msg) {
   recordReply(chatId);
   auditAutoReply({ chatId, chatName: senderName, incoming: text, outgoing: replyText });
   logger.info({ chatId }, "Auto-reply sent");
+}
+
+async function handleSelfChatMessage(sock, chatId, text) {
+  logger.info("Companion: message received in self-chat");
+
+  let replyText;
+  try {
+    replyText = await handleCompanionMessage(text);
+  } catch (err) {
+    logger.error({ err: err?.message }, "Companion reply generation failed");
+    return;
+  }
+  if (!replyText) return;
+
+  await sock.sendPresenceUpdate("composing", chatId).catch(() => {});
+  await new Promise((r) => setTimeout(r, Math.min(2500, 500 + replyText.length * 15)));
+
+  await sock.sendMessage(chatId, { text: replyText });
+  logger.info("Companion: reply sent");
 }
 
 process.on("unhandledRejection", (err) => {
